@@ -13,6 +13,7 @@ const InventoryDashboard = () => {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [transactions, setTransactions] = useState([]);
+  const [predictions, setPredictions] = useState([]); // <-- NEW STATE FOR AI
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -32,10 +33,21 @@ const InventoryDashboard = () => {
 
       if (userPerms.includes('VIEW_INVENTORY') || userPerms.includes('MANAGE_INVENTORY') || userPerms.includes('PROCESS_SALE')) {
         fetchProducts();
-        fetchTransactions(); // Auto-fetch transactions
+        fetchTransactions();
+        fetchPredictions(); // <-- FETCH AI DATA ON LOAD
       }
     } catch (err) {
       navigate('/');
+    }
+  };
+
+  const fetchPredictions = async () => {
+    try {
+      // Fetch directly from the Python microservice on port 8000
+      const res = await axios.get('http://localhost:8000/api/predict/stockout');
+      setPredictions(res.data);
+    } catch (err) {
+      console.error('Failed to fetch AI predictions from Python service');
     }
   };
 
@@ -44,7 +56,6 @@ const InventoryDashboard = () => {
       const res = await axios.get('http://localhost:8080/api/inventory/transactions', {
         headers: { Authorization: `Bearer ${token}` },
       });
-      // Sort so newest transactions are at the top
       const sortedTx = res.data.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
       setTransactions(sortedTx);
     } catch (err) {
@@ -74,6 +85,7 @@ const InventoryDashboard = () => {
       setNewProduct({ sku: '', name: '', category: '', unitPrice: '', reorderPoint: 10 });
       fetchProducts();
       fetchTransactions();
+      fetchPredictions(); // <-- REFRESH AI AFTER ACTION
       setTimeout(() => setSuccess(''), 3000);
     } catch (err) {
       setError(err.response?.data || 'Failed to add product');
@@ -95,6 +107,7 @@ const InventoryDashboard = () => {
       setStockUpdate({ sku: '', quantity: '', transactionType: 'RESTOCK', notes: '' });
       fetchProducts();
       fetchTransactions();
+      fetchPredictions(); // <-- REFRESH AI AFTER ACTION
       setTimeout(() => setSuccess(''), 3000);
     } catch (err) {
       setError(err.response?.data || 'Failed to update stock');
@@ -116,6 +129,7 @@ const InventoryDashboard = () => {
       setSaleData({ sku: '', quantity: '' });
       fetchProducts();
       fetchTransactions();
+      fetchPredictions(); // <-- REFRESH AI AFTER ACTION
       setTimeout(() => setSuccess(''), 3000);
     } catch (err) {
       setError(err.response?.data || 'Failed to process sale');
@@ -234,6 +248,48 @@ const InventoryDashboard = () => {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+
+          {/* AI PREDICTIONS PANEL: Managers & Clerks */}
+          {(permissions.includes('MANAGE_INVENTORY') || permissions.includes('VIEW_INVENTORY')) && predictions.length > 0 && (
+            <div className="card" style={{ marginTop: '24px', borderTop: '4px solid #8b5cf6' }}>
+              <h3>🧠 AI Insights & Stock-out Forecast</h3>
+              <div style={{ overflowX: 'auto' }}>
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>SKU</th>
+                      <th>Product Name</th>
+                      <th>Sales Velocity</th>
+                      <th>Days Remaining</th>
+                      <th>AI Alert Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {predictions.map((pred, idx) => (
+                      <tr key={idx}>
+                        <td><strong>{pred.sku}</strong></td>
+                        <td>{pred.name}</td>
+                        <td>{pred.velocity} units/day</td>
+                        <td style={{ fontWeight: 'bold' }}>{pred.daysRemaining === 999 ? '999+' : pred.daysRemaining} days</td>
+                        <td>
+                          <span style={{
+                            padding: '4px 8px',
+                            borderRadius: '4px',
+                            fontSize: '12px',
+                            fontWeight: 'bold',
+                            backgroundColor: pred.status === 'Healthy' ? '#ecfdf5' : (pred.status === 'Warning (Reorder Soon)' ? '#fef3c7' : '#fef2f2'),
+                            color: pred.status === 'Healthy' ? '#059669' : (pred.status === 'Warning (Reorder Soon)' ? '#d97706' : '#ef4444')
+                          }}>
+                            {pred.status}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
 
