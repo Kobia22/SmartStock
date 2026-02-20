@@ -40,30 +40,36 @@ public class UserController {
     }
 
     @PostMapping("/register")
-    public ResponseEntity<String> register(@RequestBody User user) {
+    public ResponseEntity<?> register(@RequestBody User user) {
         if (userRepository.findByUsername(user.getUsername()).isPresent()) {
-            logger.warn("Registration failed: Username {} already exists", user.getUsername());
-            return ResponseEntity.badRequest().body("Username already exists!");
+            return ResponseEntity.badRequest().body(Map.of("error", "Username already exists!"));
         }
         if (userRepository.findByEmail(user.getEmail()).isPresent()) {
-            logger.warn("Registration failed: Email {} already exists", user.getEmail());
-            return ResponseEntity.badRequest().body("Email already exists!");
+            return ResponseEntity.badRequest().body(Map.of("error", "Email already exists!"));
         }
+
         user.setPassword(passwordEncoder.encode(user.getPassword()));
+
+        // STAGE 1: Lock the account in a quarantine state
+        user.setPermissions(new HashSet<>(List.of("PENDING_APPROVAL")));
         userRepository.save(user);
-        logger.info("User registered: {}", user.getUsername());
-        return ResponseEntity.ok("User registered successfully!");
+
+        return ResponseEntity.ok(Map.of("message", "Request submitted successfully. Pending Manager approval."));
     }
 
     @PostMapping("/login")
-    public ResponseEntity<Map<String, Object>> login(@RequestBody Map<String, String> loginRequest) {
+    public ResponseEntity<?> login(@RequestBody Map<String, String> loginRequest) {
         String username = loginRequest.get("username");
         String password = loginRequest.get("password");
         User user = userRepository.findByUsername(username).orElse(null);
 
         if (user == null || !passwordEncoder.matches(password, user.getPassword())) {
-            logger.warn("Login failed for user: {}", username);
             return ResponseEntity.status(401).body(Map.of("error", "Invalid credentials"));
+        }
+
+        // PREVENT LOGIN IF IN QUARANTINE STATE
+        if (user.getPermissions().contains("PENDING_APPROVAL")) {
+            return ResponseEntity.status(401).body(Map.of("error", "Access Denied: Your account request is still pending approval by a Store Manager."));
         }
 
         UserDetails userDetails = new org.springframework.security.core.userdetails.User(
@@ -78,23 +84,80 @@ public class UserController {
         response.put("message", "Login successful!");
         response.put("token", token);
         response.put("permissions", user.getPermissions());
-        logger.info("User logged in: {}", username);
         return ResponseEntity.ok(response);
+    }
+
+    // GET QUARANTINED USERS
+    @GetMapping("/admin/pending-registrations")
+    @PreAuthorize("hasAuthority('APPROVE_USER_CREATION')")
+    public ResponseEntity<List<User>> getPendingRegistrations() {
+        List<User> pending = userRepository.findAll().stream()
+                .filter(u -> u.getPermissions().contains("PENDING_APPROVAL"))
+                .collect(Collectors.toList());
+        return ResponseEntity.ok(pending);
+    }
+
+    // STAGE 2: APPROVE OR DECLINE
+    @PostMapping("/admin/process-registration/{username}")
+    @PreAuthorize("hasAuthority('APPROVE_USER_CREATION')")
+    public ResponseEntity<?> processRegistration(@PathVariable String username, @RequestBody Map<String, String> payload) {
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new RuntimeException("User not found"));
+
+        String action = payload.get("action");
+
+        if ("APPROVE".equals(action)) {
+            // Remove the lock. They now have 0 permissions and will see the blank lock screen
+            user.getPermissions().remove("PENDING_APPROVAL");
+            userRepository.save(user);
+            return ResponseEntity.ok("User approved successfully. They currently have no roles assigned.");
+        } else if ("DECLINE".equals(action)) {
+            userRepository.delete(user);
+            return ResponseEntity.ok("User registration declined and record deleted.");
+        }
+
+        return ResponseEntity.badRequest().body("Invalid action");
+    }
+
+    // STAGE 3: DYNAMICALLY ASSIGN/REMOVE ROLES
+    @PostMapping("/admin/assign-permissions")
+    @PreAuthorize("hasAuthority('ASSIGN_PERMISSION')")
+    public ResponseEntity<String> assignPermissions(@RequestBody Map<String, Object> request, Authentication auth) {
+        String targetUsername = (String) request.get("username");
+        @SuppressWarnings("unchecked")
+        List<String> permissionsToAdd = (List<String>) request.get("permissions");
+
+        User targetUser = userRepository.findByUsername(targetUsername).orElse(null);
+        if (targetUser == null) {
+            return ResponseEntity.status(404).body("User not found");
+        }
+
+        if (permissionsToAdd.contains("ASSIGN_PERMISSION") && targetUsername.equals(auth.getName())) {
+            return ResponseEntity.status(403).body("Cannot assign ASSIGN_PERMISSION to self");
+        }
+
+        // CLEAR AND OVERWRITE: Allows for both adding and removing permissions perfectly
+        targetUser.getPermissions().clear();
+        targetUser.getPermissions().addAll(permissionsToAdd);
+        userRepository.save(targetUser);
+
+        return ResponseEntity.ok("Permissions updated successfully!");
+    }
+
+    @GetMapping("/admin/users")
+    @PreAuthorize("hasAuthority('VIEW_USER_LIST')")
+    public ResponseEntity<List<User>> getAllUsers() {
+        // Only return users who are actually approved (not pending)
+        List<User> activeUsers = userRepository.findAll().stream()
+                .filter(u -> !u.getPermissions().contains("PENDING_APPROVAL"))
+                .collect(Collectors.toList());
+        return ResponseEntity.ok(activeUsers);
     }
 
     @PostMapping("/admin/submit-request")
     @PreAuthorize("hasAnyAuthority('CREATE_USER_REQUEST', 'DELETE_USER_REQUEST')")
     public ResponseEntity<String> submitRequest(@RequestBody UserRequest request, Authentication auth) {
-        User requester = userRepository.findByUsername(auth.getName())
-                .orElseThrow(() -> new RuntimeException("User not found"));
-
-        if (request.getRequestType().equals("CREATE") && !auth.getAuthorities().contains(new org.springframework.security.core.authority.SimpleGrantedAuthority("CREATE_USER_REQUEST"))) {
-            return ResponseEntity.status(403).body("Permission denied");
-        }
-        if (request.getRequestType().equals("DELETE") && !auth.getAuthorities().contains(new org.springframework.security.core.authority.SimpleGrantedAuthority("DELETE_USER_REQUEST"))) {
-            return ResponseEntity.status(403).body("Permission denied");
-        }
-
+        User requester = userRepository.findByUsername(auth.getName()).orElseThrow(() -> new RuntimeException("User not found"));
         request.setCreatedBy(requester);
         request.setStatus("PENDING");
         userRequestRepository.save(request);
@@ -104,73 +167,14 @@ public class UserController {
     @PostMapping("/admin/approve-request/{requestId}")
     @PreAuthorize("hasAnyAuthority('APPROVE_USER_CREATION', 'APPROVE_USER_DELETION')")
     public ResponseEntity<String> approveRequest(@PathVariable Long requestId, @RequestBody Map<String, String> action, Authentication auth) {
-        User approver = userRepository.findByUsername(auth.getName())
-                .orElseThrow(() -> new RuntimeException("User not found"));
-        UserRequest request = userRequestRepository.findById(requestId)
-                .orElseThrow(() -> new RuntimeException("Request not found"));
-
-        if (request.getRequestType().equals("CREATE") && !auth.getAuthorities().contains(new org.springframework.security.core.authority.SimpleGrantedAuthority("APPROVE_USER_CREATION"))) {
-            return ResponseEntity.status(403).body("Permission denied");
-        }
-        if (request.getRequestType().equals("DELETE") && !auth.getAuthorities().contains(new org.springframework.security.core.authority.SimpleGrantedAuthority("APPROVE_USER_DELETION"))) {
-            return ResponseEntity.status(403).body("Permission denied");
-        }
+        User approver = userRepository.findByUsername(auth.getName()).orElseThrow(() -> new RuntimeException("User not found"));
+        UserRequest request = userRequestRepository.findById(requestId).orElseThrow(() -> new RuntimeException("Request not found"));
 
         String status = action.get("status");
-        if (!status.equals("APPROVED") && !status.equals("REJECTED")) {
-            return ResponseEntity.badRequest().body("Invalid status");
-        }
-
         request.setStatus(status);
         request.setApprovedBy(approver);
-        if (status.equals("APPROVED")) {
-            if (request.getRequestType().equals("CREATE")) {
-                User newUser = new User();
-                newUser.setUsername(request.getTargetUsername());
-                newUser.setEmail(request.getTargetEmail());
-                newUser.setPassword(passwordEncoder.encode("Test123!")); // Default password
-                userRepository.save(newUser);
-            } else if (request.getRequestType().equals("DELETE")) {
-                User user = userRepository.findByUsername(request.getTargetUsername())
-                        .orElseThrow(() -> new RuntimeException("User not found"));
-                userRepository.delete(user);
-            }
-        }
         userRequestRepository.save(request);
         return ResponseEntity.ok("Request " + status.toLowerCase() + " successfully!");
-    }
-
-    @PostMapping("/admin/assign-permissions")
-    @PreAuthorize("hasAuthority('ASSIGN_PERMISSION')")
-    public ResponseEntity<String> assignPermissions(@RequestBody Map<String, Object> request, Authentication auth) {
-        String targetUsername = (String) request.get("username");
-        @SuppressWarnings("unchecked")
-        List<String> permissionsToAdd = (List<String>) request.get("permissions");
-
-        User targetUser = userRepository.findByUsername(targetUsername)
-                .orElse(null);
-        if (targetUser == null) {
-            logger.warn("Permission assignment failed: User {} not found", targetUsername);
-            return ResponseEntity.status(404).body("User not found");
-        }
-
-        if (permissionsToAdd.contains("ASSIGN_PERMISSION") && targetUsername.equals(auth.getName())) {
-            logger.warn("User {} attempted to self-assign ASSIGN_PERMISSION", auth.getName());
-            return ResponseEntity.status(403).body("Cannot assign ASSIGN_PERMISSION to self");
-        }
-
-        // FIX: Add new permissions to the existing ones instead of replacing them
-        targetUser.getPermissions().addAll(permissionsToAdd);
-        userRepository.save(targetUser);
-
-        logger.info("Permissions assigned to {} by {}", targetUsername, auth.getName());
-        return ResponseEntity.ok("Permissions assigned successfully!");
-    }
-
-    @GetMapping("/admin/users")
-    @PreAuthorize("hasAuthority('VIEW_USER_LIST')")
-    public ResponseEntity<List<User>> getAllUsers() {
-        return ResponseEntity.ok(userRepository.findAll());
     }
 
     @GetMapping("/admin/requests")

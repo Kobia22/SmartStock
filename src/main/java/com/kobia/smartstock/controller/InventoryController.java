@@ -12,6 +12,8 @@ import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 import com.kobia.smartstock.dto.StockTransactionDTO;
 import java.util.stream.Collectors;
+import com.kobia.smartstock.entity.PurchaseOrder;
+import com.kobia.smartstock.repository.PurchaseOrderRepository;
 
 import java.util.List;
 import java.util.Map;
@@ -23,13 +25,16 @@ public class InventoryController {
     private final ProductRepository productRepository;
     private final StockTransactionRepository transactionRepository;
     private final UserRepository userRepository;
+    private final PurchaseOrderRepository purchaseOrderRepository; // <-- ADD THIS
 
     public InventoryController(ProductRepository productRepository,
                                StockTransactionRepository transactionRepository,
-                               UserRepository userRepository) {
+                               UserRepository userRepository,
+                               PurchaseOrderRepository purchaseOrderRepository) { // <-- ADD THIS
         this.productRepository = productRepository;
         this.transactionRepository = transactionRepository;
         this.userRepository = userRepository;
+        this.purchaseOrderRepository = purchaseOrderRepository; // <-- ADD THIS
     }
 
     // 1. View all products (Accessible to anyone with inventory permissions)
@@ -132,5 +137,37 @@ public class InventoryController {
         }).collect(Collectors.toList());
 
         return ResponseEntity.ok(auditTrail);
+    }
+
+    // 6. Generate a Purchase Order (Store Managers Only)
+    @PostMapping("/purchase-order")
+    @PreAuthorize("hasAuthority('MANAGE_INVENTORY')")
+    public ResponseEntity<?> generatePurchaseOrder(@RequestBody Map<String, Object> request, Authentication auth) {
+        String sku = (String) request.get("sku");
+        Integer quantity = (Integer) request.get("quantity");
+
+        Product product = productRepository.findBySku(sku)
+                .orElseThrow(() -> new RuntimeException("Product not found"));
+        User user = userRepository.findByUsername(auth.getName())
+                .orElseThrow(() -> new RuntimeException("User not found"));
+
+        PurchaseOrder po = new PurchaseOrder();
+        po.setProduct(product);
+        po.setQuantityOrdered(quantity);
+        po.setGeneratedBy(user);
+        // Status defaults to PENDING
+
+        purchaseOrderRepository.save(po);
+
+        return ResponseEntity.ok("Purchase Order generated successfully for " + quantity + " units of " + product.getName());
+    }
+
+    // 7. View All Purchase Orders
+    @GetMapping("/purchase-orders")
+    @PreAuthorize("hasAuthority('MANAGE_INVENTORY')")
+    public ResponseEntity<?> getPurchaseOrders() {
+        // In a real app we'd use a DTO here too, but for speed we will return the entities directly
+        // (ensure you don't have circular references in your JSON!)
+        return ResponseEntity.ok(purchaseOrderRepository.findByOrderByOrderDateDesc());
     }
 } // <--- THIS BRACE CLOSES THE ENTIRE CLASS
